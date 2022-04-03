@@ -1,26 +1,14 @@
 import path from "path";
-import {
-  defineConfig,
-  Plugin,
-  mergeConfig,
-  UserConfig,
-  normalizePath,
-} from "vite";
-import type { EmittedFile, PluginContext } from "rollup";
-import {
-  readdirSync,
-  rmSync,
-  lstatSync,
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-} from "fs";
+import { defineConfig, Plugin, mergeConfig, UserConfig } from "vite";
+import { readdirSync, rmSync, lstatSync, readFileSync, existsSync } from "fs";
 const webExt = require("web-ext");
 import { buildScript, BuildScriptConfig } from "./src/build-script";
 import { resolveBrowserTagsInObject } from "./src/resolve-browser-flags";
 import { validateManifest } from "./src/validation";
 import { HookWaiter } from "./src/hook-waiter";
-import md5 from "md5";
+import { copyDirSync } from "./src/copy-dir";
+
+const GENERATED_PREFIX = "generated:";
 
 type Manifest = any;
 
@@ -119,7 +107,7 @@ interface BrowserExtensionPluginOptions {
 
 type BuildScriptCache = Omit<BuildScriptConfig, "vite" | "watch">;
 
-export default function browserExtension(
+export default function browserExtension<T>(
   options: BrowserExtensionPluginOptions
 ): Plugin {
   function log(...args: any[]) {
@@ -153,15 +141,15 @@ export default function browserExtension(
 
   function transformManifestInputs(manifestWithTs: any): {
     transformedManifest: any;
-    generatedInputs: Record<string, string>;
-    styleAssets: string[];
+    htmlInputs: Record<string, string>;
+    assetInputs: Record<string, string>;
     generatedScriptInputs: BuildScriptCache[];
   } {
-    const inputIncludedMap: Record<string, boolean> = {};
-    const generatedInputs: Record<string, string> = {};
+    const previouslyIncludedMap: Record<string, boolean> = {};
+    const htmlInputs: Record<string, string> = {};
     const generatedScriptInputs: BuildScriptCache[] = [];
     const transformedManifest = JSON.parse(JSON.stringify(manifestWithTs));
-    const styleAssets = new Set<string>();
+    const assetInputs: Record<string, string> = {};
 
     const filenameToInput = (filename: string) =>
       filename.substring(0, filename.lastIndexOf("."));
@@ -170,7 +158,9 @@ export default function browserExtension(
       path.resolve(moduleRoot, filename);
 
     const filenameToCompiledFilename = (filename: string) =>
-      filename.replace(/.(ts)$/, ".js").replace(/.(scss)$/, ".css");
+      filename
+    .replace(/.(ts)$/, ".js")
+    .replace(/.(scss|sass|less|stylus)$/, ".css");
 
     const transformHtml = (...manifestPath: string[]) => {
       const filename = manifestPath.reduce(
@@ -178,7 +168,7 @@ export default function browserExtension(
         transformedManifest
       );
       if (filename == null) return;
-      generatedInputs[filenameToInput(filename)] = filenameToPath(filename);
+      htmlInputs[filenameToInput(filename)] = filenameToPath(filename);
     };
 
     const transformSandboxedHtml = (filename: string) => {
@@ -203,34 +193,41 @@ export default function browserExtension(
       const scripts: string[] = isSingleString ? [value] : value;
       const compiledScripts: string[] = [];
       scripts.forEach((script) => {
-        if (!inputIncludedMap[script]) {
-          generatedScriptInputs.push({
-            inputAbsPath: filenameToPath(script),
-            outputRelPath: filenameToInput(script),
-          });
+        if (script.startsWith(GENERATED_PREFIX)) {
+          log("Skip generated script:", script);
+          compiledScripts.push(
+            filenameToCompiledFilename(script).replace(GENERATED_PREFIX, "")
+          );
+        } else {
+          if (!previouslyIncludedMap[script]) {
+            generatedScriptInputs.push({
+              inputAbsPath: filenameToPath(script),
+              outputRelPath: filenameToInput(script),
+            });
+          }
+          compiledScripts.push(filenameToCompiledFilename(script));
         }
-        compiledScripts.push(filenameToCompiledFilename(script));
-        inputIncludedMap[script] = true;
+        previouslyIncludedMap[script] = true;
       });
 
       if (isSingleString) object[key] = compiledScripts[0];
       else object[key] = compiledScripts;
     };
 
-    const transformStylesheets = (object: any, key: string) => {
+    const transformAssets = (object: any, key: string) => {
       const value = object?.[key];
       if (value == null) return;
-      const styles: string[] = typeof value === "string" ? [value] : value;
+      const filenames: string[] = typeof value === "string" ? [value] : value;
       const onManifest: string[] = [];
-      styles.forEach((style) => {
-        if (style.startsWith("generated:")) {
-          log("Skip generated asset:", style);
+      filenames.forEach((filename) => {
+        if (filename.startsWith(GENERATED_PREFIX)) {
+          log("Skip generated asset:", filename);
           onManifest.push(
-            filenameToCompiledFilename(style).replace("generated:", "")
+            filenameToCompiledFilename(filename).replace(GENERATED_PREFIX, "")
           );
         } else {
-          styleAssets.add(style);
-          onManifest.push(filenameToCompiledFilename(style));
+          assetInputs[filenameToInput(filename)] = filenameToPath(filename);
+          onManifest.push(filenameToCompiledFilename(filename));
         }
       });
       object[key] = onManifest;
@@ -265,7 +262,7 @@ export default function browserExtension(
     transformHtml("background", "page");
     transformHtml("sidebar_action", "default_panel");
     additionalInputTypes?.html.forEach((filename) => {
-      generatedInputs[filenameToInput(filename)] = filenameToPath(filename);
+      htmlInputs[filenameToInput(filename)] = filenameToPath(filename);
     });
     transformedManifest.sandbox?.pages?.forEach(transformSandboxedHtml);
 
@@ -280,32 +277,15 @@ export default function browserExtension(
 
     // CSS inputs
     transformedManifest.content_scripts?.forEach((contentScript: string) => {
-      transformStylesheets(contentScript, "css");
+      transformAssets(contentScript, "css");
     });
-    transformStylesheets(additionalInputTypes, "assets");
-
-    if (isDevServer) {
-      transformedManifest.permissions.push("http://localhost/*");
-      const CSP = "script-src 'self' http://localhost:3000; object-src 'self'";
-      if (transformedManifest.content_security_policy != null) {
-        // TODO: "merge" CSPs automatically
-        warn(
-          "Could not automatically add CSP to manifest to allow extension to run against dev server. Update the CSP yourself in dev mode following this guide: TODO link"
-        );
-      } else if (transformedManifest.manifest_version === 2) {
-        transformedManifest.content_security_policy = CSP;
-      } else if (transformedManifest.manifest_version === 3) {
-        throw Error(
-          "Dev server does not work for Manifest V3 because of a Chrome Bug: https://bugs.chromium.org/p/chromium/issues/detail?id=1290188"
-        );
-      }
-    }
+    transformAssets(additionalInputTypes, "assets");
 
     return {
-      generatedInputs,
+      htmlInputs,
       transformedManifest,
       generatedScriptInputs,
-      styleAssets: Array.from(styleAssets.values()),
+      assetInputs,
     };
   }
 
@@ -317,174 +297,51 @@ export default function browserExtension(
       const folderName = queue.shift()!;
       const folderPath = path.resolve(moduleRoot, folderName);
       const children = readdirSync(folderPath).map((filename) =>
-        path.join(folderName, filename)
-      );
-      for (const childName of children) {
-        const childPath = path.resolve(moduleRoot, childName);
-        if (lstatSync(childPath).isFile()) {
-          log(`  > ${childName}`);
-          assets.push(childName);
-        } else {
-          queue.push(childName);
-        }
-      }
+                                                   path.join(folderName, filename)
+                                                  );
+                                                  for (const childName of children) {
+                                                    const childPath = path.resolve(moduleRoot, childName);
+                                                    if (lstatSync(childPath).isFile()) {
+                                                      log(`  > ${childName}`);
+                                                      assets.push(childName);
+                                                    } else {
+                                                      queue.push(childName);
+                                                    }
+                                                  }
     }
     return assets;
   }
 
-  async function viteBuildScripts() {
-    if (!hasBuiltOnce) {
-      for (const input of scriptInputs ?? []) {
-        process.stdout.write("\n");
-        info(
-          `Building \x1b[96m${path.relative(
-            process.cwd(),
-            input.inputAbsPath
-          )}\x1b[0m in Lib Mode`
-        );
-        await buildScript(
-          {
-            ...input,
-            vite: finalConfig,
-            watch: isWatching || isDevServer,
-          },
-          hookWaiter,
-          log
-        );
-      }
-      process.stdout.write("\n");
-    }
-    await hookWaiter.waitForAll();
-  }
-
-  async function launchBrowserAndInstall() {
-    if (!isWatching && !isDevServer) return;
-    if (disableAutoLaunch) return;
-
-    if (webExtRunner == null) {
-      const config = {
-        target:
-          options.browser === null || options.browser === "firefox"
-            ? null
-            : "chromium",
-        ...options.webExtConfig,
-        // No touch - can't exit the terminal if these are changed, so they cannot be overridden
-        sourceDir: outDir,
-        noReload: false,
-        noInput: true,
-      };
-      log("Passed web-ext run config:", JSON.stringify(options.webExtConfig));
-      log("Final web-ext run config:", JSON.stringify(config));
-      // https://github.com/mozilla/web-ext#using-web-ext-in-nodejs-code
-      webExtRunner = await webExt.cmd.run(config, {
-        shouldExitProgram: true,
-      });
+  function getPublicDir(): string | undefined {
+    if (finalConfig.publicDir === false) {
+      return;
+    } else if (
+      finalConfig.publicDir &&
+      path.isAbsolute(finalConfig.publicDir)
+    ) {
+      return finalConfig.publicDir;
     } else {
-      webExtRunner.reloadAllExtensions();
-      process.stdout.write("\n\n");
+      return path.join(moduleRoot, finalConfig.publicDir ?? "public");
     }
   }
 
-  async function onBuildEnd() {
-    await viteBuildScripts();
-    await launchBrowserAndInstall();
-    hasBuiltOnce = true;
+  function copyPublicDir() {
+    const publicDir = getPublicDir();
+    // Don't copy anything if the public dir isn't found
+    if (publicDir == null) return;
+    log("publicDir:", publicDir);
+    if (!existsSync(publicDir)) return;
+
+    // Make sure it's a directory
+    const info = lstatSync(publicDir);
+    if (!info.isDirectory()) {
+      warn(publicDir + " is not a directory, skipping");
+      return;
+    }
+
+    // Copy all files over
+    copyDirSync(publicDir, outDir);
   }
-
-  function pointScriptsToDevServer(
-    htmlPath: string,
-    htmlContent: string
-  ): string {
-    let newHtmlContent = htmlContent;
-    const htmlFolder = path.dirname(htmlPath);
-    console.log("replacing", htmlContent);
-    const scriptSrcRegex =
-      /(<script\s+?type="module"\s+?src="(.*?)".*?>|<script\s+?src="(.*?)"\s+?type="module".*?>)/g;
-    let match: RegExpExecArray | null;
-    while ((match = scriptSrcRegex.exec(htmlContent)) !== null) {
-      if (match.index === scriptSrcRegex.lastIndex) {
-        scriptSrcRegex.lastIndex++;
-      }
-      const [existingScriptTag, _, src1, src2] = match;
-      const src = src1 || src2;
-      console.log({ existingScriptTag, src });
-      let newSrc: string;
-      if (src.startsWith("/")) {
-        newSrc = `http://localhost:3000${src}`;
-      } else if (src.startsWith("./")) {
-        newSrc = `http://localhost:3000/${normalizePath(
-          path.join(htmlFolder, src.replace("./", ""))
-        )}`;
-      } else {
-        const aliases = (finalConfig.alias ??
-          finalConfig.resolve?.alias ??
-          {}) as Record<string, string | undefined> | undefined;
-        log("Aliases:", aliases);
-        const alias = src.substring(
-          0,
-          src.includes("/") ? src.indexOf("/") : src.length
-        );
-        const matchedPath = aliases?.[alias] ?? aliases?.[alias + "/"];
-        if (!matchedPath) {
-          warn(
-            `Failed to resolve script src alias: ${existingScriptTag}, ${src}`
-          );
-          newSrc = src;
-        } else {
-          const filePath = src.replace(alias, matchedPath);
-          const relativePath = path.relative(
-            finalConfig.root ?? process.cwd(),
-            filePath
-          );
-          newSrc = `http://localhost:3000/${normalizePath(relativePath)}`;
-        }
-      }
-      const newScriptTag = existingScriptTag.replace(src, newSrc);
-      log("Old script: " + existingScriptTag);
-      log("Dev server script: " + newScriptTag);
-      newHtmlContent = newHtmlContent.replace(existingScriptTag, newScriptTag);
-    }
-    return newHtmlContent;
-  }
-
-  let customEmitFileUnbound = function (
-    this: PluginContext,
-    file: EmittedFile
-  ) {
-    if (!isDevServer) {
-      return this.emitFile(file);
-    }
-    if (file.type !== "asset") {
-      throw Error(
-        "File type not supported in dev mode " + JSON.stringify(file, null, 2)
-      );
-    }
-
-    if (file.fileName == null)
-      throw Error(
-        "Asset filename was missing. This is an internal error, please open an issue on GitHub"
-      );
-    if (file.source == null)
-      throw Error(
-        "Asset source was missing. This is an internal error, please open an issue on GitHub"
-      );
-
-    const outFile = path.resolve(outDir, file.fileName);
-    mkdirSync(path.dirname(outFile), { recursive: true });
-    let content: any;
-    if (file.fileName.endsWith(".html")) {
-      if (typeof file.source !== "string")
-        throw Error(
-          "HTML not passed as string. This is an internal error, please open an issue on GitHub"
-        );
-      content = pointScriptsToDevServer(file.fileName, file.source);
-    } else {
-      content = file.source;
-    }
-    writeFileSync(outFile, content);
-    return md5(content);
-  };
-  let customEmitFile: PluginContext["emitFile"];
 
   const browser = options.browser ?? "chrome";
   const disableAutoLaunch = options.disableAutoLaunch ?? false;
@@ -498,25 +355,14 @@ export default function browserExtension(
   const hookWaiter = new HookWaiter("closeBundle");
   let isError = false;
   let shouldEmptyOutDir = false;
-  let isDevServer = false;
 
   return {
     name: "vite-plugin-web-extension",
 
-    config(viteConfig, { command }) {
+    config(viteConfig) {
       shouldEmptyOutDir = !!viteConfig.build?.emptyOutDir;
-      const port = viteConfig.server?.port ?? 3000;
-      isDevServer = command === "serve";
 
       const extensionConfig = defineConfig({
-        base: isDevServer ? `http://localhost:${port}/` : undefined,
-        server: {
-          port,
-          hmr: {
-            host: "localhost",
-          },
-        },
-        clearScreen: false,
         build: {
           emptyOutDir: false,
           terserOptions: {
@@ -532,7 +378,6 @@ export default function browserExtension(
             },
           },
         },
-        plugins: isDevServer ? [] : [],
       });
       finalConfig = mergeConfig(viteConfig, extensionConfig, true);
       return finalConfig;
@@ -575,48 +420,36 @@ export default function browserExtension(
         // Generate inputs
         const {
           transformedManifest,
-          generatedInputs,
+          htmlInputs: generatedInputs,
           generatedScriptInputs,
-          styleAssets,
+          assetInputs,
         } = transformManifestInputs(manifestWithTs);
 
-        rollupOptions.input = generatedInputs;
+        rollupOptions.input = { ...generatedInputs, ...assetInputs };
         scriptInputs = generatedScriptInputs;
 
-        customEmitFile = customEmitFileUnbound.bind(this);
-
-        // Emit modified html files in dev mode that point to localhost
-        if (isDevServer) {
-          // TODO: Add a file watcher here to reload the extension when an html file is changed
-          Object.entries(rollupOptions.input).forEach(([name, inputPath]) => {
-            customEmitFile({
-              type: "asset",
-              fileName: `${name}.html`,
-              source: readFileSync(inputPath, "utf-8"),
-            });
-          });
-        }
-
         // Assets
-        const assets = [...styleAssets, ...getAllAssets()];
+        const assets = getAllAssets();
         assets.forEach((asset) => {
-          customEmitFile({
+          this.emitFile({
             type: "asset",
             fileName: asset,
             source: readFileSync(path.resolve(moduleRoot, asset)),
           });
         });
 
+        // Copy public dir - only in watch mode because vite doesn't do it for some reason...
+        if (isWatching) copyPublicDir();
+
         // Add stuff to the bundle
         const manifestContent = JSON.stringify(transformedManifest, null, 2);
-        customEmitFile({
+        this.emitFile({
           type: "asset",
           fileName: options?.writeManifestTo ?? "manifest.json",
           name: "manifest.json",
           source: manifestContent,
         });
         log("Final manifest:", manifestContent);
-
         log("Final rollup inputs:", rollupOptions.input);
 
         if (options.printSummary !== false && !hasBuiltOnce) {
@@ -626,36 +459,31 @@ export default function browserExtension(
           summary.push("  Building HTML Pages in Multi-Page Mode:");
           summary.push(
             Object.values(rollupOptions.input)
-              .map((input) => {
-                const listItem = path.relative(process.cwd(), input);
-                return `\x1b[0m\x1b[2m    • ${listItem}\x1b[0m`;
-              })
-              .join("\n") || noneDisplay
+            .map((input) => {
+              const listItem = path.relative(process.cwd(), input);
+              return `\x1b[0m\x1b[2m    • ${listItem}\x1b[0m`;
+            })
+            .join("\n") || noneDisplay
           );
           summary.push("  Building in Lib Mode:");
           summary.push(
             scriptInputs
-              .map(({ inputAbsPath }) => {
-                const listItem = path.relative(process.cwd(), inputAbsPath);
-                return `\x1b[0m\x1b[2m    • ${listItem}\x1b[0m`;
-              })
-              .join("\n") || noneDisplay
+            .map(({ inputAbsPath }) => {
+              const listItem = path.relative(process.cwd(), inputAbsPath);
+              return `\x1b[0m\x1b[2m    • ${listItem}\x1b[0m`;
+            })
+            .join("\n") || noneDisplay
           );
           info(summary.join("\n"));
         }
         process.stdout.write("\n");
         info("Building HTML Pages in Multi-Page Mode");
 
-        if (isWatching || isDevServer) {
+        if (isWatching) {
           options.watchFilePaths?.forEach((file) => this.addWatchFile(file));
           assets.forEach((asset) =>
-            this.addWatchFile(path.resolve(moduleRoot, asset))
-          );
-        }
-
-        if (isDevServer) {
-          await new Promise((res) => setTimeout(res, 1000));
-          await onBuildEnd();
+                         this.addWatchFile(path.resolve(moduleRoot, asset))
+                        );
         }
       } catch (err) {
         isError = true;
@@ -673,7 +501,61 @@ export default function browserExtension(
 
     async closeBundle() {
       if (isError) return;
-      await onBuildEnd();
+
+      if (!hasBuiltOnce) {
+        for (const input of scriptInputs ?? []) {
+          process.stdout.write("\n");
+          info(
+            `Building \x1b[96m${path.relative(
+              process.cwd(),
+              input.inputAbsPath
+            )}\x1b[0m in Lib Mode`
+          );
+          await buildScript(
+            {
+              ...input,
+              vite: finalConfig,
+              watch: isWatching,
+            },
+            hookWaiter,
+            log
+          );
+        }
+        process.stdout.write("\n");
+      }
+      await hookWaiter.waitForAll();
+
+      if (!isWatching) return;
+
+      if (!disableAutoLaunch) {
+        if (webExtRunner == null) {
+          const config = {
+            target:
+              options.browser === null || options.browser === "firefox"
+                ? null
+                : "chromium",
+                ...options.webExtConfig,
+                // No touch - can't exit the terminal if these are changed, so they cannot be overridden
+                sourceDir: outDir,
+                noReload: false,
+                noInput: true,
+          };
+          log(
+            "Passed web-ext run config:",
+            JSON.stringify(options.webExtConfig)
+          );
+          log("Final web-ext run config:", JSON.stringify(config));
+          // https://github.com/mozilla/web-ext#using-web-ext-in-nodejs-code
+          webExtRunner = await webExt.cmd.run(config, {
+            shouldExitProgram: true,
+          });
+        } else {
+          webExtRunner.reloadAllExtensions();
+          process.stdout.write("\n\n");
+        }
+      }
+
+      hasBuiltOnce = true;
     },
   };
 }
